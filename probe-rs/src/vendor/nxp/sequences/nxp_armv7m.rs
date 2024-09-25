@@ -13,15 +13,18 @@ use crate::{
     architecture::arm::{
         ap::{memory_ap::MemoryApType, AccessPortError, AccessPortType},
         armv7m::{FpCtrl, FpRev2CompX},
+        communication_interface::Initialized,
         core::{
             armv7m::{Aircr, Dhcsr},
             registers::cortex_m::PC,
         },
-        memory::ArmMemoryInterface,
+        dp::{Abort, Ctrl, DpAccess as _, Select},
+        memory::{adi_v5_memory_interface::ADIMemoryInterface, ArmMemoryInterface},
         sequences::{ArmDebugSequence, ArmDebugSequenceError},
-        ArmError,
+        ArmCommunicationInterface, ArmError, DpAddress, FullyQualifiedApAddress,
     },
     core::MemoryMappedRegister,
+    MemoryInterface as _,
 };
 
 /// Debug sequences for MIMXRT10xx MCUs.
@@ -485,6 +488,8 @@ impl ArmDebugSequence for MIMXRT117x {
 pub struct MIMXRT118x(());
 
 impl MIMXRT118x {
+    const DMA4_TDC0_CH_CSR: u64 = 0x52010000;
+
     fn new() -> Self {
         Self(())
     }
@@ -493,12 +498,227 @@ impl MIMXRT118x {
     pub fn create() -> Arc<dyn ArmDebugSequence> {
         Arc::new(Self::new())
     }
+
+    fn halt_m33(
+        &self,
+        interface: &mut ArmCommunicationInterface<Initialized>,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        const SRC_SBMR2: u64 = 0x54460044;
+
+        let mut m33 =
+            ADIMemoryInterface::new(interface, &FullyQualifiedApAddress::v1_with_dp(dp, 3))?;
+        let boot_mode = (m33.read_word_32(SRC_SBMR2)? >> 24) & 0x3f;
+        if boot_mode == 8 || boot_mode == 9 {
+            tracing::info!("Boot from fuse or serial download mode, check if CM33 is halted...");
+            let cm33_dhcsr_f = Dhcsr(m33.read_word_32(Dhcsr::get_mmio_address())?);
+            if !cm33_dhcsr_f.c_halt() {
+                tracing::info!(
+                    "CM33 is not halted, trying to halt it. CM33 DHCSR = 0x{:x}",
+                    cm33_dhcsr_f.0
+                );
+                // Enable CM33 debug control
+                m33.write_word_32(Dhcsr::get_mmio_address(), 0xA05F0001)?;
+                // Halt CM33
+                m33.write_word_32(Dhcsr::get_mmio_address(), 0xA05F0003)?;
+                let cm33_dhcsr_s = Dhcsr(m33.read_word_32(Dhcsr::get_mmio_address())?);
+                if cm33_dhcsr_s.c_halt() {
+                    tracing::info!("CM33 is halted now. CM33 DHCSR = 0x{:x}", cm33_dhcsr_s.0);
+                } else {
+                    tracing::warn!(
+                        "CM33 is still running, halt failed. CM33 DHCSR = 0x{:x}",
+                        cm33_dhcsr_s.0
+                    );
+                }
+            } else {
+                tracing::info!(
+                    "CM33 is halted already. CM33 DHCSR = 0x{:x}",
+                    cm33_dhcsr_f.0
+                );
+            }
+        } else {
+            tracing::info!("Flash execution mode, leave CM33 run status as it was...");
+        }
+        Ok(())
+    }
+
+    /// Start the M7 core to make its AP available.
+    fn start_cm7(
+        &self,
+        interface: &mut ArmCommunicationInterface<Initialized>,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        const BLK_CTRL_S_AONMIX_M7_CFG: u64 = 0x544F0080;
+        const ROSC400M_CTRL1: u64 = 0x54484350;
+        const CLOCK_ROOT0_CONTROL: u64 = 0x54450000;
+        const SRC_GENERAL_REG_SCR: u64 = 0x54460010;
+        const MU_RT_S3MUA_TR0: u64 = 0x57540200;
+        const MU_RT_S3MUA_RR0: u64 = 0x57540280;
+        const MU_RT_S3MUA_RR1: u64 = 0x57540284;
+
+        // The AP for the M7 is not available, so use the one for the M33.
+        let mut m33 =
+            ADIMemoryInterface::new(interface, &FullyQualifiedApAddress::v1_with_dp(dp, 3))?;
+        let reg = m33.read_word_32(BLK_CTRL_S_AONMIX_M7_CFG)?;
+        if reg & 0x10 == 0 {
+            tracing::info!("CM7 is running already");
+        } else {
+            tracing::info!("Start to kickoff CM7");
+
+            // Clock Preparation
+            m33.write_word_32(ROSC400M_CTRL1, 0x0)?;
+            m33.write_word_32(CLOCK_ROOT0_CONTROL, 0x100)?;
+
+            // VTOR 0x00
+            m33.write_word_32(BLK_CTRL_S_AONMIX_M7_CFG, 0x0010)?;
+
+            // Release CM7
+            m33.write_word_32(SRC_GENERAL_REG_SCR, 0x1)?;
+
+            // DMA initialization
+            self.init_cm7_tcm(&mut m33)?;
+
+            // Making Landing Zone
+            m33.write_word_32(0x303C0000, 0x20000000)?;
+            m33.write_word_32(0x303C0004, 0x00000009)?;
+            m33.write_word_32(0x303C0008, 0xE7FEE7FE)?;
+
+            // Trigger ELE
+            m33.write_word_32(MU_RT_S3MUA_TR0, 0x17d20106)?;
+            let resp1 = m33.read_word_32(MU_RT_S3MUA_RR0)?;
+            let resp2 = m33.read_word_32(MU_RT_S3MUA_RR1)?;
+            tracing::debug!("RESP1 = 0x{resp1:x}");
+            tracing::debug!("RESP2 = 0x{resp2:x}");
+
+            // Deassert CM7 Wait
+            m33.write_word_32(BLK_CTRL_S_AONMIX_M7_CFG, 0x0)?;
+
+            tracing::info!("CM7 is kicked-off");
+        }
+        Ok(())
+    }
+
+    fn init_cm7_tcm(&self, m33: &mut impl ArmMemoryInterface) -> Result<(), ArmError> {
+        let reg = m33.read_word_32(Self::DMA4_TDC0_CH_CSR)?;
+        if reg & 0x80000000 != 0 {
+            self.wait_dma4_finished(m33)?;
+        }
+        self.start_dma4(m33, 0x303C0000)?;
+        self.wait_dma4_finished(m33)?;
+        self.start_dma4(m33, 0x30400000)?;
+        self.wait_dma4_finished(m33)?;
+        Ok(())
+    }
+
+    fn wait_dma4_finished(&self, m33: &mut impl ArmMemoryInterface) -> Result<(), ArmError> {
+        let start = Instant::now();
+        loop {
+            let reg = m33.read_word_32(Self::DMA4_TDC0_CH_CSR)?;
+            if reg & 0x40000000 == 0 {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(1) {
+                return Err(ArmError::Timeout);
+            }
+        }
+        self.clear_dma4_done(m33)
+    }
+
+    fn start_dma4(
+        &self,
+        m33: &mut impl ArmMemoryInterface,
+        target_addr: u32,
+    ) -> Result<(), ArmError> {
+        const DMA4_TCD0_SLAST_SGA: u64 = 0x5201002C;
+        const DMA4_TCD0_DLAST_SGA: u64 = 0x52010038;
+        const DMA4_TCD0_SADDR: u64 = 0x52010020;
+        const DMA4_TCD0_DADDR: u64 = 0x52010030;
+        const DMA4_TCD0_NBYTES_MLOFFNO: u64 = 0x52010028;
+        const DMA4_TCD0_ELINKNO: u64 = 0x52010036;
+        const DMA4_TCD0_BITER_ELINKNO: u64 = 0x5201003E;
+        const DMA4_TCD0_ATTR: u64 = 0x52010026;
+        const DMA4_TCD0_SOFF: u64 = 0x52010024;
+        const DMA4_TCD0_DOFF: u64 = 0x52010034;
+        const DMA4_TCD0_CSR: u64 = 0x5201003C;
+
+        self.clear_dma4_done(m33)?;
+        m33.write_word_32(DMA4_TCD0_SLAST_SGA, 0x00000000)?;
+        m33.write_word_32(DMA4_TCD0_DLAST_SGA, 0x00000000)?;
+        self.clear_dma4_done(m33)?;
+        m33.write_word_32(DMA4_TCD0_SADDR, 0x20484000)?;
+        m33.write_word_32(DMA4_TCD0_DADDR, target_addr)?;
+        m33.write_word_32(DMA4_TCD0_NBYTES_MLOFFNO, 0x40000)?;
+        m33.write_word_16(DMA4_TCD0_ELINKNO, 0x1)?;
+        m33.write_word_16(DMA4_TCD0_BITER_ELINKNO, 0x1)?;
+        m33.write_word_16(DMA4_TCD0_ATTR, 0x0303)?;
+        m33.write_word_16(DMA4_TCD0_SOFF, 0x0)?;
+        m33.write_word_16(DMA4_TCD0_DOFF, 0x8)?;
+        m33.write_word_32(Self::DMA4_TDC0_CH_CSR, 0x7)?;
+        m33.write_word_16(DMA4_TCD0_CSR, 0x8)?;
+        m33.write_word_16(DMA4_TCD0_CSR, 0x9)?;
+
+        Ok(())
+    }
+
+    fn clear_dma4_done(&self, m33: &mut impl ArmMemoryInterface) -> Result<(), ArmError> {
+        m33.write_word_32(Self::DMA4_TDC0_CH_CSR, 0x40000000)
+    }
 }
 
 impl ArmDebugSequence for MIMXRT118x {
+    fn debug_port_start(
+        &self,
+        interface: &mut ArmCommunicationInterface<Initialized>,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        // Switch to DP Register Bank 0
+        interface.write_dp_register(dp, Select(0))?;
+
+        let ctrl = interface.read_dp_register::<Ctrl>(dp)?;
+        let powered_down = !(ctrl.csyspwrupack() && ctrl.cdbgpwrupack());
+        if powered_down {
+            tracing::info!("Debug port {dp:x?} is powered down, powering up");
+            let mut ctrl = Ctrl(0);
+            ctrl.set_cdbgpwrupreq(true);
+            ctrl.set_csyspwrupreq(true);
+            interface.write_dp_register(dp, ctrl)?;
+
+            let start = Instant::now();
+            loop {
+                let ctrl = interface.read_dp_register::<Ctrl>(dp)?;
+                if ctrl.csyspwrupack() && ctrl.cdbgpwrupack() {
+                    break;
+                }
+                if start.elapsed() >= Duration::from_secs(1) {
+                    return Err(ArmError::Timeout);
+                }
+            }
+        }
+
+        // Init AP Transfer Mode, Transaction Counter, and Lane Mask (Normal Transfer Mode, Include all Byte Lanes)
+        let mut ctrl = Ctrl(0);
+        ctrl.set_cdbgpwrupreq(true);
+        ctrl.set_csyspwrupreq(true);
+        ctrl.set_mask_lane(0b1111);
+        interface.write_dp_register(dp, ctrl)?;
+
+        // Clear errors, but don't DAPABORT.
+        let mut abort = Abort(0);
+        abort.set_orunerrclr(true);
+        abort.set_wderrclr(true);
+        abort.set_stkerrclr(true);
+        abort.set_stkcmpclr(true);
+        interface.write_dp_register(dp, abort)?;
+
+        self.halt_m33(interface, dp)?;
+        self.start_cm7(interface, dp)?;
+
+        Ok(())
+    }
+
     fn allowed_access_ports(&self) -> Vec<u8> {
         // AP5 locks the whole DP if you try to read its IDR.
-        vec![0, 1, 3, 4, 6]
+        vec![0, 1, 2, 3, 4, 6]
     }
 }
 
